@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════
+# ComfyUI Universal Installer
+#
+# Usage:
+#   bash install.sh <workflow_id>[,workflow_id2,...]
+#   bash install.sh --dry-run <workflow_id>    # verify URLs only
+#   bash install.sh ALL                         # install everything
+#
+# IDEMPOTENT: safe to re-run. Skips existing files/nodes.
+# INCREMENTAL: adding workflows only downloads missing models.
+# PLATFORM: auto-detects RunPod / Vast.ai / local
+#
+# Required env vars:
+#   HF_TOKEN      — HuggingFace access token
+#   CIVITAI_TOKEN — CivitAI API key (optional, for some workflows)
+# ══════════════════════════════════════════════════════════════
+set -uo pipefail
+# NOTE: no -e — errors handled per-function, script continues on failures
+
+START_TIME=$(date +%s)
+
+# ── Remove broken JS extensions from Swwan vendor ──
+# Swwan/web/js/*.js имеет битые импорты `../../rgthree/common/...`
+# которые резолвятся в 404 и вызывают "Loading Error" в ComfyUI frontend.
+# Все 22 наших workflow используют ноды Swwan через NODE_CLASS_MAPPINGS (Python),
+# виджеты для них берутся из настоящих ComfyUI-KJNodes/LayerStyle/rgthree-comfy.
+# Удаляем `web/` чтобы убрать конфликт без потери функционала.
+rm -rf /workspace/ComfyUI/custom_nodes/ComfyUI_Swwan/web 2>/dev/null || true
+
+# Parse --dry-run flag
+export DRY_RUN=0
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) export DRY_RUN=1 ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- "${ARGS[@]:-}"
+
+# Resolve script directory
+if [ -f "$0" ] && [ "$0" != "bash" ] && [ "$0" != "/dev/stdin" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+else
+    SCRIPT_DIR="/tmp/comfyui-deploy"
+    if [ ! -d "$SCRIPT_DIR" ]; then
+        echo "Downloading installer..."
+        git clone --quiet --depth 1 "https://github.com/treforyan-hue/comfyui-deploy-dev.git" "$SCRIPT_DIR" 2>/dev/null || {
+            echo "ERROR: Cannot download installer. Check internet connection."
+            exit 1
+        }
+    else
+        cd "$SCRIPT_DIR" && git pull --quiet 2>/dev/null || true
+    fi
+fi
+export SCRIPT_DIR
+
+# Source libraries
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/nodes.sh"
+
+# Parse workflow IDs
+WORKFLOW_IDS="${1:-}"
+if [ -z "$WORKFLOW_IDS" ]; then
+    echo "ComfyUI Universal Installer"
+    echo ""
+    echo "Usage: bash install.sh <workflow_id>[,id2,...]"
+    echo "       bash install.sh --dry-run <workflow_id>  # verify URLs"
+    echo ""
+    echo "Available workflows:"
+    echo "  privateki      — Wan 2.2 dance/animation (24GB)"
+    echo "  ofm_tech_v2    — Best quality Wan animation (48GB)"
+    echo "  icy_scail_2    — SCAIL + Flux pose I2V (48GB)"
+    echo "  ofm_i2v_gen3   — Dasiwa image-to-video (24GB)"
+    echo "  ofm_faceswp    — Flux 2 face swap (24GB)"
+    echo "  controlnt      — Z-Image-Turbo ControlNet (12GB)"
+    echo "  ofm_skin_gen3  — Realistic skin SDXL (16GB)"
+    echo "  ofm_dt_gen3    — Flux 2 Klein image gen (16GB)"
+    echo "  ofm_zit_gen    — Z-Image-Turbo fast gen (12GB)"
+    echo "  kiara_sasat    — SDXL reference gen (16GB)"
+    echo "  ofm_dataset_gen — Florence2 captioning (8GB)"
+    echo "  ofm_nsfw       — INSTARAW pipeline (16GB)"
+    echo "  animator_v25   — Animator V2.5 Wan 2.2 + Uni3C (24GB)"
+    echo "  feihou_animator — FeiHou Animator Wan 2.2 + SDPose + SAM3 (24GB)"
+    echo "  tokyo_sage     — Tokyo Sage Wan 2.2 Animate alt (80GB)"
+    echo "  ofmtech_identity_swap — Flux 2 Klein 9b identity swap (24GB)"
+    echo "  instaraw_wan22 — INSTARAW WAN 2.2 T2I + FaceDetailer (48GB)"
+    echo "  instaraw_zimage — INSTARAW Z-Image Pro (24GB)"
+    echo "  instaraw_faceswap — INSTARAW outfit/hair/character swap (12GB)"
+    echo "  instaraw_teleport — INSTARAW background teleport (12GB)"
+    echo "  instaraw_booba — INSTARAW Flux Kontext body enhance (24GB)"
+    echo "  instaraw_big   — INSTARAW NanoBanana/Gemini API (12GB, no models)"
+    echo "  instaraw_bypass_max — INSTARAW anti-detection (12GB, no models)"
+    echo "  ALL            — Everything (~250GB)"
+    exit 1
+fi
+
+if [ "$WORKFLOW_IDS" = "ALL" ]; then
+    WORKFLOW_IDS="privateki,ofm_tech_v2,icy_scail_2,ofm_i2v_gen3,ofm_faceswp,controlnt,ofm_skin_gen3,ofm_dt_gen3,ofm_zit_gen,kiara_sasat,ofm_dataset_gen,ofm_nsfw,animator_v25,feihou_animator"
+fi
+
+IFS=',' read -ra WF_ARRAY <<< "$WORKFLOW_IDS"
+
+if [ "$DRY_RUN" = "1" ]; then
+    section "DRY RUN — verifying URLs for: ${WF_ARRAY[*]}"
+else
+    log "Workflows: ${WF_ARRAY[*]}"
+    detect_platform
+    log "Platform: $PLATFORM"
+fi
+
+# ══════════════════════════════════════
+# STEP 0: Checks
+# ══════════════════════════════════════
+section "Pre-flight checks"
+
+# Install aria2c for fast parallel downloads (if not in Docker image)
+_ensure_aria2
+
+if [ -z "${HF_TOKEN:-}" ]; then
+    warn "HF_TOKEN not set. Some model downloads will fail."
+fi
+
+if [ "$DRY_RUN" = "0" ]; then
+    AVAIL_GB=$(df --output=avail -BG /workspace 2>/dev/null | tail -1 | tr -d ' G' || echo 999)
+    log "Disk available: ${AVAIL_GB}GB"
+fi
+
+# ══════════════════════════════════════
+# STEP 1: ComfyUI (skip in dry-run)
+# ══════════════════════════════════════
+if [ "$DRY_RUN" = "0" ]; then
+    section "ComfyUI installation"
+
+    if [ ! -f "$COMFY/main.py" ]; then
+        log "Cloning ComfyUI..."
+        git clone --quiet "https://github.com/comfyanonymous/ComfyUI.git" "$COMFY"
+        pip install --break-system-packages -q -r "$COMFY/requirements.txt"
+    else
+        log "ComfyUI already installed"
+    fi
+
+    # Гарантия версии ComfyUI = пин (образ её и так печёт; это idempotent-страховка
+    # на случай дрейфа / старого baked-comfy). bb560036 (30.05) = LTX-2.3 audio VAE +
+    # ResizeImageMaskNode V3-схема. На корректном поде = быстрый no-op (1 rev-parse).
+    COMFY_PIN="bb560036"
+    if [ -d "$COMFY/.git" ]; then
+        CUR=$(git -C "$COMFY" rev-parse --short=8 HEAD 2>/dev/null || echo none)
+        case "$CUR" in
+            ${COMFY_PIN}*) log "ComfyUI at pin ($CUR)" ;;
+            *)
+                log "ComfyUI: $CUR -> pin $COMFY_PIN"
+                git -C "$COMFY" fetch --quiet origin 2>/dev/null || true
+                # -f: server.py патчится в STEP 2.5 (apply_runtime_patches Patch 1) → working tree
+                # «грязный» → без -f checkout прерывается. Патч переприменяется, потеря безопасна.
+                if git -C "$COMFY" checkout --quiet -f "$COMFY_PIN" 2>/dev/null; then
+                    pip install --break-system-packages -q -r "$COMFY/requirements.txt" 2>/dev/null || true
+                    log "ComfyUI pinned to $COMFY_PIN"
+                else
+                    warn "ComfyUI: checkout $COMFY_PIN failed (offline?), keeping $CUR"
+                fi ;;
+        esac
+    fi
+
+    python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
+        warn "PyTorch/CUDA not detected — Docker image should have it, skipping reinstall"
+    }
+
+    # ПОЛНЫЙ набор папок: на новом comfy (bb560036) get_filename_list() на
+    # несуществующей папке бросает FileNotFoundError → нода вылетает из object_info
+    # (красная). На старом comfy отсутствие было безобидно. Создаём всё, что
+    # запрашивают ноды (список собран эмпирически из comfyui.log на поде).
+    mkdir -p "$MODELS"/{diffusion_models,unet,vae,vae_approx,text_encoders,clip,clip_vision,clip_gguf,loras,checkpoints}
+    mkdir -p "$MODELS"/{upscale_models,latent_upscale_models,detection,sam2,sam3,sams,rife,controlnet,model_patches,seedvr2}
+    mkdir -p "$MODELS"/{luts,yolo,onnx,embeddings,style_models,photomaker,gligen,hypernetworks,configs,prompt_generator}
+    mkdir -p "$MODELS"/{audio_encoders,background_removal,frame_interpolation,geometry_estimation,optical_flow}
+    mkdir -p "$MODELS"/ultralytics/{bbox,segm}
+    mkdir -p "$COMFY/user/default/workflows"
+fi
+
+# ══════════════════════════════════════
+# STEP 2: Custom Nodes
+# ══════════════════════════════════════
+install_all_nodes
+
+# ══════════════════════════════════════
+# STEP 2.5: Runtime patches (idempotent)
+# ══════════════════════════════════════
+apply_runtime_patches
+
+
+# ══════════════════════════════════════
+# STEP 2.7: Pre-flight CUDA gate (ДО скачки моделей)
+# ══════════════════════════════════════
+# Раньше CUDA проверялась только на STEP 5 (старт ComfyUI) — ПОСЛЕ скачки 62 ГБ.
+# Если у хоста битый GPU (cuInit падает "unknown error", при этом nvidia-smi
+# работает — наблюдалось на Vast RTX PRO 6000 Blackwell), мы зря качали 62 ГБ и
+# крутили 3 ретрая ComfyUI ~17 мин. Теперь ловим мёртвый GPU ЗДЕСЬ за ~60с и
+# аборт ДО скачки. Бот читает маркер CUDA_DEAD → помечает хост битым (#5).
+if [ "$DRY_RUN" = "0" ]; then
+    log "Pre-flight: проверяю CUDA до скачки моделей..."
+    PF_CUDA_OK=0
+    for i in $(seq 1 15); do   # до ~60с на boot-гонку CUDA
+        if python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+            PF_CUDA_OK=1
+            log "Pre-flight CUDA OK after $((i * 4))s"
+            break
+        fi
+        sleep 4
+    done
+    if [ "$PF_CUDA_OK" = "0" ]; then
+        err "=== CUDA_DEAD ==="
+        err "GPU на этом хосте не инициализирует CUDA (cuInit fail; nvidia-smi может работать)."
+        err "Битый хост — НЕ качаю модели (экономлю 62 ГБ и 15 мин). Пересоздай под — попадёшь на другой хост."
+        exit 44
+    fi
+fi
+
+# ══════════════════════════════════════
+# STEP 3: Models (per workflow)
+# ══════════════════════════════════════
+section "Model downloads"
+
+for wf_file in "$SCRIPT_DIR"/workflows/*.sh; do
+    source "$wf_file"
+done
+
+for wf_id in "${WF_ARRAY[@]}"; do
+    wf_id=$(echo "$wf_id" | tr -d ' ')
+    func_name="models_${wf_id}"
+    if type "$func_name" &>/dev/null; then
+        "$func_name"
+        # Wait for parallel downloads in this workflow to finish before next
+        dl_wait_all
+    else
+        warn "Unknown workflow: $wf_id (no function $func_name)"
+    fi
+done
+
+# Bail out if any model failed — bot reads exit code to know pod is broken
+# Without this, install.sh exits 0 even with DL_FAIL>0, bot marks ready,
+# user sees red nodes in ComfyUI. See feedback_install_sh_silent_fail.md.
+if [ "$DRY_RUN" = "0" ] && [ "$DL_FAIL" -gt 0 ]; then
+    err "Install aborted: $DL_FAIL downloads failed (OK=$DL_OK SKIP=$DL_SKIP). Pod NOT ready."
+    exit 43
+fi
+
+# ══════════════════════════════════════
+# STEP 4: Post-install (skip in dry-run)
+# ══════════════════════════════════════
+if [ "$DRY_RUN" = "0" ]; then
+    section "Post-install fixes"
+
+    make_link "$MODELS/vae/ae.safetensors" "$MODELS/vae/flux_vae.safetensors"
+    make_link "$MODELS/vae/Wan2_1_VAE_bf16.safetensors" "$MODELS/vae/wan_2.1_vae.safetensors"
+    make_link "$MODELS/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors" "$MODELS/text_encoders/umt5-xxl-enc-fp8_e4m3fn.safetensors"
+    make_link "$MODELS/text_encoders/qwen_3_4b.safetensors" "$MODELS/clip/qwen_3_4b.safetensors"
+    make_link "$MODELS/text_encoders/qwen_3_8b_fp8mixed.safetensors" "$MODELS/clip/qwen_3_8b_fp8mixed.safetensors"
+    make_link "$MODELS/text_encoders/qwen_3_8b.safetensors" "$MODELS/clip/qwen_3_8b.safetensors"
+
+    # t5xxl + clip_l: one-directional only (avoid circular symlinks)
+    # Real file location depends on which workflow downloaded it
+    if [ -f "$MODELS/text_encoders/t5xxl_fp8_e4m3fn.safetensors" ] && [ ! -L "$MODELS/text_encoders/t5xxl_fp8_e4m3fn.safetensors" ]; then
+        make_link "$MODELS/text_encoders/t5xxl_fp8_e4m3fn.safetensors" "$MODELS/clip/t5xxl_fp8_e4m3fn.safetensors"
+    elif [ -f "$MODELS/clip/t5xxl_fp8_e4m3fn.safetensors" ] && [ ! -L "$MODELS/clip/t5xxl_fp8_e4m3fn.safetensors" ]; then
+        make_link "$MODELS/clip/t5xxl_fp8_e4m3fn.safetensors" "$MODELS/text_encoders/t5xxl_fp8_e4m3fn.safetensors"
+    fi
+    if [ -f "$MODELS/text_encoders/clip_l.safetensors" ] && [ ! -L "$MODELS/text_encoders/clip_l.safetensors" ]; then
+        make_link "$MODELS/text_encoders/clip_l.safetensors" "$MODELS/clip/clip_l.safetensors"
+    elif [ -f "$MODELS/clip/clip_l.safetensors" ] && [ ! -L "$MODELS/clip/clip_l.safetensors" ]; then
+        make_link "$MODELS/clip/clip_l.safetensors" "$MODELS/text_encoders/clip_l.safetensors"
+    fi
+
+    if [ -f "$MODELS/rife/rife49.pth" ]; then
+        make_link "$MODELS/rife/rife49.pth" "$CNODES/ComfyUI-Frame-Interpolation/ckpts/rife/rife49.pth"
+    fi
+
+    # imageio-ffmpeg already in Docker image, skip pip
+    rm -rf /tmp/pip* /tmp/torch* 2>/dev/null || true
+fi
+
+# ══════════════════════════════════════
+# STEP 5: Start ComfyUI (skip in dry-run)
+# ══════════════════════════════════════
+if [ "$DRY_RUN" = "0" ]; then
+    section "Starting ComfyUI"
+
+    # CUDA-гейт: ждём готовности GPU ДО старта (лечит boot-гонку CUDA на свежем поде,
+    # из-за которой ComfyUI падал на старте — а ретрая не было).
+    log "Waiting for CUDA to be ready..."
+    for i in $(seq 1 30); do
+        if python3 -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+            log "CUDA ready after $((i * 4))s"
+            break
+        fi
+        sleep 4
+    done
+
+    # Старт с РЕТРАЕМ: если процесс умер/не поднялся за 5 мин — перезапуск (до 3 попыток).
+    READY=0
+    for attempt in 1 2 3; do
+        pkill -f "python.*main.py" 2>/dev/null || true
+        sleep 2
+        cd "$COMFY"
+        nohup python3 main.py --listen 0.0.0.0 --port 8188 > /workspace/comfyui.log 2>&1 &
+        CPID=$!
+        log "Start attempt $attempt — PID $CPID, waiting up to 5 min..."
+        for i in $(seq 1 60); do
+            if ! kill -0 "$CPID" 2>/dev/null; then
+                warn "ComfyUI process died on attempt $attempt"
+                break
+            fi
+            if curl -s http://localhost:8188/system_stats > /dev/null 2>&1; then
+                READY=1
+                break
+            fi
+            sleep 5
+        done
+        [ "$READY" = "1" ] && break
+        warn "Attempt $attempt failed — last log lines:"
+        tail -12 /workspace/comfyui.log 2>/dev/null
+    done
+
+    if [ "$READY" = "1" ]; then
+        NC=$(curl -s http://localhost:8188/object_info | python3 -c "import json,sys;print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+        GP=$(curl -s http://localhost:8188/system_stats | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['devices'][0]['name'])" 2>/dev/null || echo "?")
+
+        detect_platform
+
+        ELAPSED=$(( $(date +%s) - START_TIME ))
+        section "DONE"
+        log "Platform:  $PLATFORM"
+        log "GPU:       $GP"
+        log "Nodes:     $NC loaded"
+        log "Time:      $((ELAPSED / 60))m $((ELAPSED % 60))s"
+        log "Downloads: $DL_OK ok, $DL_SKIP skipped, $DL_FAIL failed"
+        log "URL:       $COMFYUI_URL"
+        log "Log:       /workspace/comfyui.log"
+    else
+        err "ComfyUI did not start in 5 min"
+        err "Check: tail -50 /workspace/comfyui.log"
+    fi
+else
+    # Dry-run summary
+    ELAPSED=$(( $(date +%s) - START_TIME ))
+    section "DRY RUN RESULTS"
+    log "URLs checked: $((DL_OK + DL_FAIL))"
+    log "OK:     $DL_OK"
+    log "FAILED: $DL_FAIL"
+    log "Time:   ${ELAPSED}s"
+    if [ "$DL_FAIL" -gt 0 ]; then
+        err "Some URLs failed! Fix before deploying."
+        exit 1
+    else
+        log "All URLs verified — ready to deploy!"
+    fi
+fi
