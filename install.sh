@@ -46,7 +46,7 @@ else
     SCRIPT_DIR="/tmp/comfyui-deploy"
     if [ ! -d "$SCRIPT_DIR" ]; then
         echo "Downloading installer..."
-        git clone --quiet --depth 1 "https://github.com/treforyan-hue/comfyui-deploy-dev.git" "$SCRIPT_DIR" 2>/dev/null || {
+        git clone --quiet --depth 1 "https://github.com/treforyan-hue/comfyui-deploy-partner.git" "$SCRIPT_DIR" 2>/dev/null || {
             echo "ERROR: Cannot download installer. Check internet connection."
             exit 1
         }
